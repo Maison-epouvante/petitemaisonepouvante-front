@@ -1,0 +1,134 @@
+# Frontend GitLab CI/CD Pipeline
+stages:
+  - build
+  - test
+  - qualite
+  - package
+  - deploy
+
+variables:
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  GIT_DEPTH: "0"
+  IMAGE_NAME: "${CI_REGISTRY_IMAGE}/front"
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+
+.node-env:
+  image: node:20
+  cache:
+    key: node-${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+
+build_front:
+  stage: build
+  extends: .node-env
+  script:
+    - npm ci
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+
+test_front:
+  stage: test
+  extends: .node-env
+  needs:
+    - job: build_front
+      artifacts: true
+  script:
+    - npm run test:coverage || true
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    reports:
+      junit: coverage/junit.xml
+    expire_in: 1 week
+  coverage: '/^All files.*?(\d+.\d+)%/'
+
+sonarcloud-check:
+  stage: qualite
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  needs:
+    - job: test_front
+      artifacts: true
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: sonar-cache
+    paths:
+      - .sonar/cache
+  script:
+    - sonar-scanner -Dsonar.token=$SONAR_TOKEN -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=maisonepouvante -Dsonar.projectKey=maisonepouvante-front -Dsonar.projectName="Frontend" -Dsonar.sources=src -Dsonar.tests=src -Dsonar.test.inclusions=**/*.test.ts,**/*.test.tsx -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+  only:
+    - main
+    - develop
+    - merge_requests
+
+sast:
+  stage: qualite
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+build_dist:
+  stage: package
+  extends: .node-env
+  needs:
+    - job: build_front
+      artifacts: true
+    - job: sonarcloud-check
+      artifacts: false
+  script:
+    - npm run build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+  only:
+    - main
+    - develop
+
+docker_push_front:
+  stage: package
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  needs:
+    - job: build_dist
+      artifacts: true
+    - job: test_front
+      artifacts: false
+    - job: sonarcloud-check
+      artifacts: false
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
+    - docker push "$IMAGE_NAME:$IMAGE_TAG"
+    - if [ "$CI_COMMIT_BRANCH" = "main" ]; then docker tag "$IMAGE_NAME:$IMAGE_TAG" "$IMAGE_NAME:latest" && docker push "$IMAGE_NAME:latest"; fi
+  only:
+    - main
+    - develop
+  when: manual
+
+deploy_front:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  needs:
+    - job: docker_push_front
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+  script:
+    - kubectl set image deployment/front front="$IMAGE_NAME:$IMAGE_TAG" --namespace=$KUBE_NAMESPACE
+    - kubectl rollout status deployment/front --namespace=$KUBE_NAMESPACE --timeout=120s
+  environment:
+    name: production
+  only:
+    - main
+  when: manual
